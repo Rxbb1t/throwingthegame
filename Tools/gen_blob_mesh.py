@@ -9,21 +9,29 @@ Writes <outdir>/SK_Blob.fbx plus preview renders.
 
 SHAPE STRATEGY -- read this before changing anything.
 
-The reference (Snaptic) is a DETACHED sphere head above a single continuous
-torso-arms-legs form with soft, blobby shoulders and hips. Two separate problems:
+The body is SIX SEPARATE ISLANDS in one mesh: torso, head, two arms, two legs. They
+are NOT welded to each other, and that is deliberate.
 
-  * The body must be a SMOOTH union. An earlier version voxel-remeshed overlapping
-    primitives, but a remesh is a HARD union: it leaves a sharp crease where the arm
-    meets the torso, which read as gills. The body is therefore a METABALL field --
-    Blender metaballs are a smooth (blobby) union natively, which is exactly the
-    reference's shoulder treatment.
-  * The head must NOT participate in that union, or it welds to the torso. It is
-    built as an ordinary sphere mesh and joined afterwards as a separate island.
+Earlier versions fused them into one continuous skin (first a voxel remesh, then a
+metaball field). Both looked right standing still and both failed the moment a limb
+moved: vertices in the arm/torso transition are weighted partly to a moving bone and
+partly to a stationary one, so the surface between them stretches into a membrane.
+That is what "gills" were. A single continuous skin MUST stretch there -- it is what
+skinning does -- so no amount of blend-width tuning removes it, it only hides it at
+small angles.
 
-Metaball surfaces form where the summed field crosses `threshold`, so they sit some
-way INSIDE the element radii. Rather than hand-tuning that, calibrate() measures the
-shrink on a test ball and every radius is divided through by it. Change the threshold
-or stiffness and the calibration follows automatically.
+Separate islands cannot stretch. They stay looking connected because of one fact:
+
+    A SPHERE CENTRED ON A JOINT IS INVARIANT UNDER ROTATION ABOUT THAT JOINT.
+
+So each limb carries a ball centred exactly on its pivot -- a shoulder ball, a hip
+ball -- sunk into the torso. The limb swings out of a bulge that never moves and never
+separates, so there is no gap to expose and no membrane to stretch, at any angle. Each
+limb island is metaball-fused WITH ITSELF (ball + capsule) for a soft shoulder, but
+never with the torso.
+
+Consequently skin weights do NO cross-part blending. Each vertex belongs wholly to one
+part; the only blends are within a limb, across its own elbow or knee.
 
 Three facts about the Blender -> Unreal FBX trip, all established the hard way:
 
@@ -52,56 +60,51 @@ from mathutils import Vector
 
 TOTAL_H = 96.0
 
-# Torso: a rounded slab.
 TORSO_Z0, TORSO_Z1 = 36.0, 71.0
 TORSO_W, TORSO_D = 23.0, 16.0
 
-# Head: a sphere floating clear of the shoulders, as in the reference. HEAD_GAP is
-# the air between torso top and head underside -- the thing that makes it read as a
-# separate ball rather than a lollipop.
+# Head: a sphere floating clear of the shoulders, as in the reference.
 HEAD_D = 22.0
 HEAD_GAP = 3.0
-HEAD_CZ = TORSO_Z1 + HEAD_GAP + HEAD_D / 2.0     # -> 85.0, so the crown lands on 96
+HEAD_CZ = TORSO_Z1 + HEAD_GAP + HEAD_D / 2.0     # -> 85.0, crown lands on 96
 
-# Arms. Bone chain shoulder -> elbow -> wrist, vertical. The metaball capsule leans
-# outward so it merges into the torso at the shoulder and swings clear below it.
+# Arms. SHOULDER is the pivot and must sit ON or just inside the torso wall
+# (half-width 11.5) so the shoulder ball is sunk into the body -- that is what hides
+# the join. The axis then leans outward to the wrist so the arm reads as its own tube.
 ARM_D = 7.5
-SHOULDER = (0.0, 15.0, 66.0)
-ARM_TOP_Y, ARM_BOT_Y = 13.5, 18.0
-ELBOW_Z = 51.0
-WRIST_Z = 36.0
+SHOULDER = (0.0, 11.0, 66.0)
+ELBOW = (0.0, 13.5, 51.0)
+WRIST = (0.0, 16.0, 36.0)
+SHOULDER_BALL = 5.2                # > ARM_D/2, so the shoulder reads as a deltoid bulge
 
-# Legs. The foot point sits one radius above the ground so the capsule's bottom cap
-# lands on z = 0 rather than 5 cm underneath it.
+# Legs. Same trick: the hip ball is centred on the hip pivot, sunk into the torso.
 LEG_D = 10.0
 HIP = (0.0, 7.0, 36.0)
-KNEE_Z = 20.0
-FOOT_Z = 5.0
+KNEE = (0.0, 7.0, 20.0)
+FOOT = (0.0, 7.0, 5.0)             # one radius up, so the capsule cap lands on z = 0
+HIP_BALL = 6.0
 
 PELVIS_Z = 36.0
 
-# Metaball field. STIFFNESS controls how eagerly neighbouring elements blend into one
-# another: higher is blobbier and softer, lower keeps limbs distinct. This is the knob
-# for "gills vs melted".
-MBALL_RESOLUTION = 0.7
+# Metaball field, used WITHIN a limb only (ball + capsule -> soft shoulder), never
+# across parts. Stiffness is how softly the ball melts into the limb.
+MBALL_RESOLUTION = 0.55
 MBALL_THRESHOLD = 0.6
 MBALL_STIFFNESS = 2.6
-TARGET_TRIS = 2200
+TARGET_TRIS = 2400
 
+TORSO_ROUND = 0.9                  # fraction of half-depth spent on corner rounding
 HEAD_RADIAL, HEAD_RINGS = 20, 14
 
-# Skin weights.
-JOINT_BLEND = 0.25                 # blend band across a joint, as a fraction of the
-                                   # shorter adjacent segment
-PART_BLEND = 3.0                   # cm over which one part's weights cross into another's
+JOINT_BLEND = 0.30                 # blend band across an elbow/knee, as a fraction of
+                                   # the shorter adjacent segment
 
-# Preview material -- MI_Blob_Mint's teal at the spec's target shading.
 SKIN_RGB = (0.06, 0.62, 0.55)
 SKIN_ROUGH, SKIN_METAL = 0.18, 0.1
 
 
 # =============================================================================
-# Signed distance functions -- the analytic body, used for skinning after meshing
+# Signed distance functions -- the analytic body, used to classify vertices
 # =============================================================================
 
 def sd_round_box(p, centre, half, r):
@@ -122,20 +125,15 @@ def sd_capsule(p, a, b, r):
     return (ap - ab * t).length - r
 
 
-def arm_segment(sy):
-    """Arm axis: tucked into the torso at the shoulder, leaning out to the wrist."""
-    return (Vector((0.0, sy * ARM_TOP_Y, SHOULDER[2])),
-            Vector((0.0, sy * ARM_BOT_Y, WRIST_Z)))
-
-
-def leg_segment(sy):
-    return (Vector((0.0, sy * HIP[1], HIP[2])), Vector((0.0, sy * HIP[1], FOOT_Z)))
+def mirror(v, sy):
+    return Vector((v[0], sy * v[1], v[2]))
 
 
 def body_parts():
-    """The analytic body. Each entry: (name, sdf callable)."""
+    """The analytic body. Each entry: (name, sdf). Used only to decide which island a
+    vertex belongs to, so a limb's sdf is min(its ball, its capsule)."""
     torso_c = Vector((0.0, 0.0, (TORSO_Z0 + TORSO_Z1) / 2.0))
-    corner = TORSO_D / 2.0 * 0.9
+    corner = TORSO_D / 2.0 * TORSO_ROUND
     torso_h = Vector((TORSO_D / 2.0 - corner, TORSO_W / 2.0 - corner,
                       (TORSO_Z1 - TORSO_Z0) / 2.0 - corner))
     parts = [
@@ -143,10 +141,12 @@ def body_parts():
         ("head", lambda p: sd_sphere(p, Vector((0.0, 0.0, HEAD_CZ)), HEAD_D / 2.0)),
     ]
     for side, sy in (("L", -1.0), ("R", 1.0)):
-        a, b = arm_segment(sy)
-        parts.append(("arm" + side, lambda p, a=a, b=b: sd_capsule(p, a, b, ARM_D / 2.0)))
-        c, d = leg_segment(sy)
-        parts.append(("leg" + side, lambda p, c=c, d=d: sd_capsule(p, c, d, LEG_D / 2.0)))
+        sh, wr = mirror(SHOULDER, sy), mirror(WRIST, sy)
+        parts.append(("arm" + side, lambda p, sh=sh, wr=wr: min(
+            sd_sphere(p, sh, SHOULDER_BALL), sd_capsule(p, sh, wr, ARM_D / 2.0))))
+        hp, ft = mirror(HIP, sy), mirror(FOOT, sy)
+        parts.append(("leg" + side, lambda p, hp=hp, ft=ft: min(
+            sd_sphere(p, hp, HIP_BALL), sd_capsule(p, hp, ft, LEG_D / 2.0))))
     return parts
 
 
@@ -165,7 +165,6 @@ def wipe():
 
 
 def _to_mesh(obj):
-    """Convert a metaball object to a mesh and return the resulting object."""
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
@@ -174,63 +173,65 @@ def _to_mesh(obj):
 
 
 def calibrate():
-    """Measure how far inside its element radius a metaball surface actually forms.
-
-    Returns the factor to divide radii by. Doing this rather than hard-coding a fudge
-    means threshold and stiffness stay free to tune without breaking every dimension.
-    """
+    """Measure how far inside its element radius a metaball surface forms, so radii can
+    be corrected automatically instead of by a hardcoded fudge."""
     mb = bpy.data.metaballs.new("Cal")
     mb.resolution, mb.threshold = 0.25, MBALL_THRESHOLD
     obj = bpy.data.objects.new("Cal", mb)
     bpy.context.collection.objects.link(obj)
     e = mb.elements.new()
     e.type, e.co, e.radius, e.stiffness = "BALL", (0, 0, 0), 10.0, MBALL_STIFFNESS
-
     mesh_obj = _to_mesh(obj)
     actual = max(v.co.length for v in mesh_obj.data.vertices)
     bpy.data.objects.remove(mesh_obj, do_unlink=True)
     return actual / 10.0
 
 
-def build_body(gain):
-    """Torso + arms + legs as one smooth metaball union. No head."""
-    mb = bpy.data.metaballs.new("Body")
+def build_limb(name, gain, joint, tip, joint_ball, limb_r):
+    """One limb as its OWN metaball field: a ball on the pivot fused with the capsule.
+
+    Its own field, not a shared one -- fusing a limb to the torso is exactly what
+    produced the stretching. The distinct object name keeps Blender from blending it
+    with the other limbs.
+    """
+    mb = bpy.data.metaballs.new(name)
     mb.resolution, mb.render_resolution = MBALL_RESOLUTION, MBALL_RESOLUTION
     mb.threshold = MBALL_THRESHOLD
-    obj = bpy.data.objects.new("Body", mb)
+    obj = bpy.data.objects.new(name, mb)
     bpy.context.collection.objects.link(obj)
 
-    def elem(kind, co, radius, size=None, direction=None):
-        e = mb.elements.new()
-        e.type, e.co = kind, co
-        e.radius, e.stiffness = radius / gain, MBALL_STIFFNESS
-        if size:
-            e.size_x, e.size_y, e.size_z = size
-        if direction:
-            e.rotation = Vector((1.0, 0.0, 0.0)).rotation_difference(direction)
-        return e
+    ball = mb.elements.new()
+    ball.type, ball.co = "BALL", joint
+    ball.radius, ball.stiffness = joint_ball / gain, MBALL_STIFFNESS
 
-    # Torso. A CUBE element is a rounded box: size_* is the flat core, radius the
-    # rounding around it, so the two together make the slab.
-    round_r = TORSO_D / 2.0 * 0.9
-    core = Vector((max(TORSO_D / 2.0 - round_r, 0.1),
-                   max(TORSO_W / 2.0 - round_r, 0.1),
-                   max((TORSO_Z1 - TORSO_Z0) / 2.0 - round_r, 0.1)))
-    elem("CUBE", (0.0, 0.0, (TORSO_Z0 + TORSO_Z1) / 2.0), round_r, size=core)
-
-    for sy in (-1.0, 1.0):
-        for (a, b), r in ((arm_segment(sy), ARM_D / 2.0), (leg_segment(sy), LEG_D / 2.0)):
-            d = b - a
-            elem("CAPSULE", (a + b) / 2.0, r,
-                 size=(d.length / 2.0, 0.0, 0.0), direction=d.normalized())
+    d = tip - joint
+    cap = mb.elements.new()
+    cap.type, cap.co = "CAPSULE", (joint + tip) / 2.0
+    cap.radius, cap.stiffness = limb_r / gain, MBALL_STIFFNESS
+    cap.size_x = d.length / 2.0
+    cap.rotation = Vector((1.0, 0.0, 0.0)).rotation_difference(d.normalized())
 
     return _to_mesh(obj)
 
 
+def build_torso(gain):
+    mb = bpy.data.metaballs.new("Torso")
+    mb.resolution, mb.render_resolution = MBALL_RESOLUTION, MBALL_RESOLUTION
+    mb.threshold = MBALL_THRESHOLD
+    obj = bpy.data.objects.new("Torso", mb)
+    bpy.context.collection.objects.link(obj)
+
+    round_r = TORSO_D / 2.0 * TORSO_ROUND
+    e = mb.elements.new()
+    e.type, e.co = "CUBE", (0.0, 0.0, (TORSO_Z0 + TORSO_Z1) / 2.0)
+    e.radius, e.stiffness = round_r / gain, MBALL_STIFFNESS
+    e.size_x = max(TORSO_D / 2.0 - round_r, 0.05)
+    e.size_y = max(TORSO_W / 2.0 - round_r, 0.05)
+    e.size_z = max((TORSO_Z1 - TORSO_Z0) / 2.0 - round_r, 0.05)
+    return _to_mesh(obj)
+
+
 def build_head():
-    """The head is an ordinary sphere, deliberately OUTSIDE the metaball field: put it
-    in the field and it welds to the shoulders, and the reference's head is clearly a
-    separate ball."""
     bm = bmesh.new()
     bmesh.ops.create_uvsphere(bm, u_segments=HEAD_RADIAL, v_segments=HEAD_RINGS,
                               radius=HEAD_D / 2.0)
@@ -243,11 +244,11 @@ def build_head():
     return obj
 
 
-def assemble(body, head):
+def assemble(objs):
     bpy.ops.object.select_all(action="DESELECT")
-    body.select_set(True)
-    head.select_set(True)
-    bpy.context.view_layer.objects.active = body
+    for o in objs:
+        o.select_set(True)
+    bpy.context.view_layer.objects.active = objs[0]
     bpy.ops.object.join()
     obj = bpy.context.view_layer.objects.active
     obj.name = "BlobMesh"
@@ -258,8 +259,7 @@ def assemble(body, head):
         dec.decimate_type, dec.ratio = "COLLAPSE", TARGET_TRIS / float(tris)
         bpy.ops.object.modifier_apply(modifier=dec.name)
 
-    # The metaball surface forms inside its elements, which lifts the feet off the
-    # floor. Drop the whole figure back onto z = 0.
+    # Metaball surfaces form inside their elements, lifting the feet off the floor.
     lift = min(v.co.z for v in obj.data.vertices)
     for v in obj.data.vertices:
         v.co.z -= lift
@@ -268,20 +268,21 @@ def assemble(body, head):
     return obj
 
 
-BONES = [
-    # name,       head,                           tail,                          parent
-    ("Pelvis",    (0, 0, PELVIS_Z),               (0, 0, PELVIS_Z + 6),          None),
-    ("Spine",     (0, 0, TORSO_Z0),               (0, 0, TORSO_Z1),              "Pelvis"),
-    ("Head",      (0, 0, TORSO_Z1),               (0, 0, TOTAL_H),               "Spine"),
-    ("UpperArmL", (0, -SHOULDER[1], SHOULDER[2]), (0, -SHOULDER[1], ELBOW_Z),    "Spine"),
-    ("ForeArmL",  (0, -SHOULDER[1], ELBOW_Z),     (0, -SHOULDER[1], WRIST_Z),    "UpperArmL"),
-    ("UpperArmR", (0, SHOULDER[1], SHOULDER[2]),  (0, SHOULDER[1], ELBOW_Z),     "Spine"),
-    ("ForeArmR",  (0, SHOULDER[1], ELBOW_Z),      (0, SHOULDER[1], WRIST_Z),     "UpperArmR"),
-    ("ThighL",    (0, -HIP[1], HIP[2]),           (0, -HIP[1], KNEE_Z),          "Pelvis"),
-    ("ShinL",     (0, -HIP[1], KNEE_Z),           (0, -HIP[1], FOOT_Z),          "ThighL"),
-    ("ThighR",    (0, HIP[1], HIP[2]),            (0, HIP[1], KNEE_Z),           "Pelvis"),
-    ("ShinR",     (0, HIP[1], KNEE_Z),            (0, HIP[1], FOOT_Z),           "ThighR"),
-]
+def bone_table():
+    b = [("Pelvis", (0, 0, PELVIS_Z), (0, 0, PELVIS_Z + 6), None),
+         ("Spine", (0, 0, TORSO_Z0), (0, 0, TORSO_Z1), "Pelvis"),
+         ("Head", (0, 0, TORSO_Z1), (0, 0, TOTAL_H), "Spine")]
+    for side, sy in (("L", -1.0), ("R", 1.0)):
+        sh, el, wr = mirror(SHOULDER, sy), mirror(ELBOW, sy), mirror(WRIST, sy)
+        b.append(("UpperArm" + side, sh, el, "Spine"))
+        b.append(("ForeArm" + side, el, wr, "UpperArm" + side))
+        hp, kn, ft = mirror(HIP, sy), mirror(KNEE, sy), mirror(FOOT, sy)
+        b.append(("Thigh" + side, hp, kn, "Pelvis"))
+        b.append(("Shin" + side, kn, ft, "Thigh" + side))
+    return b
+
+
+BONES = bone_table()
 
 
 def build_armature():
@@ -297,9 +298,9 @@ def build_armature():
         if parent:
             b.parent = arm_data.edit_bones[parent]
             b.use_connect = b.head == b.parent.tail
-        # Explicit roll: put local X on world Y for EVERY bone, so pitch is rotation
-        # about local X whichever way the bone points. Blender's automatic roll does
-        # not do this and it twisted the legs.
+        # Explicit roll: local X on world Y for EVERY bone, so pitch is rotation about
+        # local X whichever way the bone points. Blender's automatic roll twisted the
+        # legs.
         d = (b.tail - b.head).normalized()
         b.align_roll(Vector((0.0, 1.0, 0.0)).cross(d))
 
@@ -307,59 +308,68 @@ def build_armature():
     return arm_obj
 
 
-def joint_blend(z, joint_z, band):
-    """1.0 = fully the upper bone, 0.0 = fully the lower one, linear across the band."""
-    if band <= 1e-6:
-        return 1.0 if z >= joint_z else 0.0
-    return min(1.0, max(0.0, (z - (joint_z - band / 2.0)) / band))
+def along(p, a, b):
+    """Fraction of the way from a to b, projected onto the segment."""
+    ab, ap = b - a, p - a
+    if ab.length_squared < 1e-9:
+        return 0.0
+    return min(1.0, max(0.0, ap.dot(ab) / ab.length_squared))
 
 
-def part_weights(name, p):
+def part_weights(name, p, sy_lookup):
+    """Weights for a vertex known to belong to `name`.
+
+    No cross-part term: islands never share vertices, so the only blend is a limb's
+    own elbow or knee. Measured along the limb axis rather than by z, because the arm
+    axis leans outward.
+    """
     if name == "torso":
         return {"Spine": 1.0}
     if name == "head":
         return {"Head": 1.0}
+
     side = name[-1]
+    sy = sy_lookup[side]
     if name.startswith("arm"):
-        band = JOINT_BLEND * min(SHOULDER[2] - ELBOW_Z, ELBOW_Z - WRIST_Z)
-        w = joint_blend(p.z, ELBOW_Z, band)
-        return {"UpperArm" + side: w, "ForeArm" + side: 1.0 - w}
-    band = JOINT_BLEND * min(HIP[2] - KNEE_Z, KNEE_Z - FOOT_Z)
-    w = joint_blend(p.z, KNEE_Z, band)
-    return {"Thigh" + side: w, "Shin" + side: 1.0 - w}
+        joint, mid, tip = mirror(SHOULDER, sy), mirror(ELBOW, sy), mirror(WRIST, sy)
+        upper, lower = "UpperArm" + side, "ForeArm" + side
+    else:
+        joint, mid, tip = mirror(HIP, sy), mirror(KNEE, sy), mirror(FOOT, sy)
+        upper, lower = "Thigh" + side, "Shin" + side
+
+    t = along(p, joint, tip)
+    t_mid = along(mid, joint, tip)
+    band = JOINT_BLEND * min(t_mid, 1.0 - t_mid)
+    if band <= 1e-6:
+        w = 1.0 if t <= t_mid else 0.0
+    else:
+        w = 1.0 - min(1.0, max(0.0, (t - (t_mid - band / 2.0)) / band))
+    return {upper: w, lower: 1.0 - w}
 
 
-def assign_weights(mesh_obj, arm_obj):
-    """Skin from the analytic body rather than by bone heat.
+def weight_island(obj, part_name, sy):
+    """Weight ONE island, before anything is joined.
 
-    Metaball meshing produces topology with no relationship to the parts that made it,
-    and the torso is a slab that must not deform. So every vertex is classified by
-    signed distance to the ORIGINAL primitives and the two nearest parts cross-fade
-    over PART_BLEND cm. Head and torso are excluded from that cross-fade -- they are
-    separate islands with air between them, and blending would drag the torso's top
-    around whenever the head moved.
+    Weights are assigned per island rather than by classifying vertices against the
+    analytic body, because the two disagree exactly where it matters: the shoulder and
+    hip balls are deliberately sunk INSIDE the torso, so torso vertices around them are
+    nearer the limb's surface than the torso's. Classifying by distance handed those
+    vertices to the limb, and they tore off with it when it swung. The island already
+    knows what it is -- use that.
+
+    Every island declares every group so that join() merges them by name consistently.
     """
-    parts = body_parts()
-    groups = {name: mesh_obj.vertex_groups.new(name=name) for name, _, _, _ in BONES}
-
-    for v in mesh_obj.data.vertices:
-        p = v.co
-        ds = sorted(((sdf(p), name) for name, sdf in parts), key=lambda t: t[0])
-        (d1, n1), (d2, n2) = ds[0], ds[1]
-
-        w = dict(part_weights(n1, p))
-        detached = {n1, n2} == {"head", "torso"}
-        if not detached and d2 - d1 < PART_BLEND:
-            t = 0.5 + 0.5 * ((d2 - d1) / PART_BLEND)
-            w = {k: val * t for k, val in w.items()}
-            for k, val in part_weights(n2, p).items():
-                w[k] = w.get(k, 0.0) + val * (1.0 - t)
-
+    groups = {name: obj.vertex_groups.new(name=name) for name, _, _, _ in BONES}
+    for v in obj.data.vertices:
+        w = part_weights(part_name, v.co, {"L": -1.0, "R": 1.0}) if sy is None else \
+            part_weights(part_name, v.co, {part_name[-1]: sy})
         total = sum(w.values()) or 1.0
         for bone, val in w.items():
             if val > 1e-4:
                 groups[bone].add([v.index], val / total, "REPLACE")
 
+
+def bind(mesh_obj, arm_obj):
     mesh_obj.parent = arm_obj
     mesh_obj.modifiers.new("Armature", "ARMATURE").object = arm_obj
 
@@ -411,8 +421,8 @@ def setup_render():
 
 
 def aim_camera(cam, yaw_deg, dist=330.0, target_z=50.0):
-    """yaw 0 == facing the camera. The figure faces +X (UE actor-forward) and its arms
-    spread along Y, so starting the camera on -Y sights straight down the arms."""
+    """yaw 0 == facing the camera. The figure faces +X and its arms spread along Y, so
+    starting the camera on -Y sights straight down the arms."""
     a = math.radians(yaw_deg)
     cam.location = (dist * math.cos(a), dist * math.sin(a), target_z + 42.0)
     d = Vector((0, 0, target_z)) - Vector(cam.location)
@@ -425,8 +435,8 @@ def render_to(path):
 
 
 def pose(arm_obj, angles):
-    """angles: {bone_name: pitch_degrees}. Every bone's roll was set so local X is
-    world Y, so pitch is rotation about local X for all of them."""
+    """angles: {bone_name: pitch_degrees}. Every bone's roll puts local X on world Y,
+    so pitch is rotation about local X for all of them."""
     bpy.context.view_layer.objects.active = arm_obj
     bpy.ops.object.mode_set(mode="POSE")
     for pb in arm_obj.pose.bones:
@@ -451,34 +461,51 @@ def main():
     gain = calibrate()
     print("GEN_MBALL_GAIN: %.4f" % gain)
 
-    mesh_obj = assemble(build_body(gain), build_head())
+    # (object, part name, side sign). Each island is weighted from its own identity
+    # before any joining -- see weight_island().
+    islands = [(build_torso(gain), "torso", None), (build_head(), "head", None)]
+    for side, sy in (("L", -1.0), ("R", 1.0)):
+        islands.append((build_limb("Arm" + side, gain, mirror(SHOULDER, sy),
+                                   mirror(WRIST, sy), SHOULDER_BALL, ARM_D / 2.0),
+                        "arm" + side, sy))
+        islands.append((build_limb("Leg" + side, gain, mirror(HIP, sy),
+                                   mirror(FOOT, sy), HIP_BALL, LEG_D / 2.0),
+                        "leg" + side, sy))
+
+    for obj, part_name, sy in islands:
+        weight_island(obj, part_name, sy)
+
+    mesh_obj = assemble([o for o, _, _ in islands])
     arm_obj = build_armature()
-    assign_weights(mesh_obj, arm_obj)
+    bind(mesh_obj, arm_obj)
     mesh_obj.data.materials.append(make_material())
 
     zs = [v.co.z for v in mesh_obj.data.vertices]
-    ys = [abs(v.co.y) for v in mesh_obj.data.vertices]
     print("GEN_VERTS:", len(mesh_obj.data.vertices))
     print("GEN_TRIS:", sum(len(p.vertices) - 2 for p in mesh_obj.data.polygons))
+    print("GEN_ISLANDS:", len(islands))
     print("GEN_HEIGHT: %.2f to %.2f" % (min(zs), max(zs)))
-    print("GEN_HALFWIDTH: %.2f" % max(ys))
 
     cam = setup_render()
     for label, yaw in (("front", 0), ("three_quarter", 38), ("side", 90), ("back", 180)):
         aim_camera(cam, yaw)
         render_to(os.path.join(outdir, "preview_" + label))
 
+    # Extreme angles. If a join is going to tear or stretch, it shows here.
     pose(arm_obj, {"UpperArmL": -55, "ForeArmL": -50, "UpperArmR": 38, "ForeArmR": -28,
                    "ThighL": 42, "ShinL": -60, "ThighR": -30, "ShinR": -18})
     aim_camera(cam, 34)
     render_to(os.path.join(outdir, "preview_bend"))
 
-    # Walk pose from the SIDE. A forward/back limb swing is almost invisible head-on,
-    # which made an earlier walk render look like the pose had not applied at all.
+    # Walk pose from the SIDE. A forward/back swing is almost invisible head-on.
     pose(arm_obj, {"UpperArmL": -28, "ForeArmL": -18, "UpperArmR": 28, "ForeArmR": -10,
                    "ThighL": 30, "ShinL": -35, "ThighR": -22, "ShinR": -8})
     aim_camera(cam, 90)
     render_to(os.path.join(outdir, "preview_walk"))
+
+    # Same walk pose, three-quarter: the shoulder join is most exposed from here.
+    aim_camera(cam, 38)
+    render_to(os.path.join(outdir, "preview_walk_34"))
     pose(arm_obj, {})
 
     fbx = os.path.join(outdir, "SK_Blob.fbx")
