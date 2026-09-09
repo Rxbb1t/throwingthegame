@@ -7,11 +7,23 @@ constants below, so changing a proportion is a re-run, not a remodel.
 
 Writes <outdir>/SK_Blob.fbx plus preview renders.
 
-THE BODY IS ONE CONTINUOUS SURFACE. The parts are built as separate primitives, then
-voxel-remeshed into a single fused skin so arms and legs flow out of the torso instead
-of being pills parked beside it. That fusion destroys any notion of "which part is this
-vertex", so skin weights are computed from the SIGNED DISTANCE to the original analytic
-primitives, which survives the remesh exactly. See assign_weights().
+SHAPE STRATEGY -- read this before changing anything.
+
+The reference (Snaptic) is a DETACHED sphere head above a single continuous
+torso-arms-legs form with soft, blobby shoulders and hips. Two separate problems:
+
+  * The body must be a SMOOTH union. An earlier version voxel-remeshed overlapping
+    primitives, but a remesh is a HARD union: it leaves a sharp crease where the arm
+    meets the torso, which read as gills. The body is therefore a METABALL field --
+    Blender metaballs are a smooth (blobby) union natively, which is exactly the
+    reference's shoulder treatment.
+  * The head must NOT participate in that union, or it welds to the torso. It is
+    built as an ordinary sphere mesh and joined afterwards as a separate island.
+
+Metaball surfaces form where the summed field crosses `threshold`, so they sit some
+way INSIDE the element radii. Rather than hand-tuning that, calibrate() measures the
+shrink on a test ball and every radius is divided through by it. Change the threshold
+or stiffness and the calibration follows automatically.
 
 Three facts about the Blender -> Unreal FBX trip, all established the hard way:
 
@@ -38,33 +50,29 @@ from mathutils import Vector
 # Units are UE centimetres, z = 0 at the feet.
 # =============================================================================
 
-TOTAL_H = 95.0
+TOTAL_H = 96.0
 
-# Torso: a rounded slab. The bevel is most of the depth, which is what stops it
-# reading as a box with tidied edges.
-TORSO_Z0, TORSO_Z1 = 36.0, 73.0
+# Torso: a rounded slab.
+TORSO_Z0, TORSO_Z1 = 36.0, 71.0
 TORSO_W, TORSO_D = 23.0, 16.0
-TORSO_BEVEL = 7.0                  # max is TORSO_D/2; at 7 of 8 the sides are near-round
-TORSO_BEVEL_SEGS = 6
 
-# Head: a sphere sitting ON the torso, not floating above it. Its underside is at
-# exactly TORSO_Z1 so the remesh fuses the two into one form.
+# Head: a sphere floating clear of the shoulders, as in the reference. HEAD_GAP is
+# the air between torso top and head underside -- the thing that makes it read as a
+# separate ball rather than a lollipop.
 HEAD_D = 22.0
-HEAD_CZ = 84.0
+HEAD_GAP = 3.0
+HEAD_CZ = TORSO_Z1 + HEAD_GAP + HEAD_D / 2.0     # -> 85.0, so the crown lands on 96
 
-# Arms. Bone chain shoulder -> elbow -> wrist. The mesh capsule spans shoulder to
-# wrist, so its top hemisphere is centred ON the shoulder joint and pivoting cannot
-# tear a hole in the torso.
+# Arms. Bone chain shoulder -> elbow -> wrist, vertical. The metaball capsule leans
+# outward so it merges into the torso at the shoulder and swings clear below it.
 ARM_D = 7.5
-SHOULDER = (0.0, 15.0, 68.0)       # BONE position, vertical. The mesh capsule leans:
-ARM_TOP_Y, ARM_BOT_Y = 14.0, 18.0  # tucked into the torso at the shoulder, swinging clear
-                                   # of it by the wrist -- connected at the top, a distinct
-                                   # tube below, which is how the reference reads
-ELBOW_Z = 52.0
+SHOULDER = (0.0, 15.0, 66.0)
+ARM_TOP_Y, ARM_BOT_Y = 13.5, 18.0
+ELBOW_Z = 51.0
 WRIST_Z = 36.0
 
 # Legs. The foot point sits one radius above the ground so the capsule's bottom cap
-# lands exactly on z = 0 rather than 5 cm underneath it.
+# lands on z = 0 rather than 5 cm underneath it.
 LEG_D = 10.0
 HIP = (0.0, 7.0, 36.0)
 KNEE_Z = 20.0
@@ -72,22 +80,20 @@ FOOT_Z = 5.0
 
 PELVIS_Z = 36.0
 
-# Fusion + budget.
-VOXEL_SIZE = 1.1                   # at 2.2 the remesh webbed the arms to the torso and
-                                   # welded the legs together; the gaps need resolving
-SMOOTH_FACTOR, SMOOTH_REPEAT = 0.3, 1   # two passes at 0.5 closed the gaps again
+# Metaball field. STIFFNESS controls how eagerly neighbouring elements blend into one
+# another: higher is blobbier and softer, lower keeps limbs distinct. This is the knob
+# for "gills vs melted".
+MBALL_RESOLUTION = 0.7
+MBALL_THRESHOLD = 0.6
+MBALL_STIFFNESS = 2.6
 TARGET_TRIS = 2200
 
-# Tessellation of the source primitives (pre-remesh; only affects fusion fidelity).
-LIMB_RADIAL, LIMB_BODY_RINGS, LIMB_CAP_RINGS = 12, 6, 4
-HEAD_RADIAL, HEAD_RINGS = 16, 10
+HEAD_RADIAL, HEAD_RINGS = 20, 14
 
 # Skin weights.
 JOINT_BLEND = 0.25                 # blend band across a joint, as a fraction of the
                                    # shorter adjacent segment
-PART_BLEND = 3.0                   # cm over which one part's weights cross into another's.
-                                   # At 5 the torso near the shoulder took enough arm weight
-                                   # to drag out as a web when the arm swung.
+PART_BLEND = 3.0                   # cm over which one part's weights cross into another's
 
 # Preview material -- MI_Blob_Mint's teal at the spec's target shading.
 SKIN_RGB = (0.06, 0.62, 0.55)
@@ -95,15 +101,15 @@ SKIN_ROUGH, SKIN_METAL = 0.18, 0.1
 
 
 # =============================================================================
-# Signed distance functions -- the analytic body, used for skinning after fusion
+# Signed distance functions -- the analytic body, used for skinning after meshing
 # =============================================================================
 
 def sd_round_box(p, centre, half, r):
     q = Vector((abs(p.x - centre.x) - half.x,
                 abs(p.y - centre.y) - half.y,
                 abs(p.z - centre.z) - half.z))
-    outside = Vector((max(q.x, 0.0), max(q.y, 0.0), max(q.z, 0.0))).length
-    return outside + min(max(q.x, max(q.y, q.z)), 0.0) - r
+    return (Vector((max(q.x, 0.0), max(q.y, 0.0), max(q.z, 0.0))).length
+            + min(max(q.x, max(q.y, q.z)), 0.0) - r)
 
 
 def sd_sphere(p, centre, r):
@@ -117,88 +123,31 @@ def sd_capsule(p, a, b, r):
 
 
 def arm_segment(sy):
-    """The arm capsule's axis: tucked in at the shoulder, leaning out to the wrist."""
+    """Arm axis: tucked into the torso at the shoulder, leaning out to the wrist."""
     return (Vector((0.0, sy * ARM_TOP_Y, SHOULDER[2])),
             Vector((0.0, sy * ARM_BOT_Y, WRIST_Z)))
+
+
+def leg_segment(sy):
+    return (Vector((0.0, sy * HIP[1], HIP[2])), Vector((0.0, sy * HIP[1], FOOT_Z)))
 
 
 def body_parts():
     """The analytic body. Each entry: (name, sdf callable)."""
     torso_c = Vector((0.0, 0.0, (TORSO_Z0 + TORSO_Z1) / 2.0))
-    torso_h = Vector((TORSO_D / 2.0 - TORSO_BEVEL,
-                      TORSO_W / 2.0 - TORSO_BEVEL,
-                      (TORSO_Z1 - TORSO_Z0) / 2.0 - TORSO_BEVEL))
+    corner = TORSO_D / 2.0 * 0.9
+    torso_h = Vector((TORSO_D / 2.0 - corner, TORSO_W / 2.0 - corner,
+                      (TORSO_Z1 - TORSO_Z0) / 2.0 - corner))
     parts = [
-        ("torso", lambda p: sd_round_box(p, torso_c, torso_h, TORSO_BEVEL)),
+        ("torso", lambda p: sd_round_box(p, torso_c, torso_h, corner)),
         ("head", lambda p: sd_sphere(p, Vector((0.0, 0.0, HEAD_CZ)), HEAD_D / 2.0)),
     ]
     for side, sy in (("L", -1.0), ("R", 1.0)):
         a, b = arm_segment(sy)
         parts.append(("arm" + side, lambda p, a=a, b=b: sd_capsule(p, a, b, ARM_D / 2.0)))
-        c = Vector((0.0, sy * HIP[1], HIP[2]))
-        d = Vector((0.0, sy * HIP[1], FOOT_Z))
+        c, d = leg_segment(sy)
         parts.append(("leg" + side, lambda p, c=c, d=d: sd_capsule(p, c, d, LEG_D / 2.0)))
     return parts
-
-
-# =============================================================================
-# Geometry helpers
-# =============================================================================
-
-def revolve(profile, radial):
-    """Revolve a (radius, z) profile around z. A radius of 0 becomes a pole vertex,
-    which is what lets this build both capsules and spheres with no cap special case."""
-    verts, rings = [], []
-    for r, z in profile:
-        if r <= 1e-9:
-            rings.append([len(verts)])
-            verts.append(Vector((0.0, 0.0, z)))
-        else:
-            ring = []
-            for i in range(radial):
-                a = 2.0 * math.pi * i / radial
-                ring.append(len(verts))
-                verts.append(Vector((r * math.cos(a), r * math.sin(a), z)))
-            rings.append(ring)
-    faces = []
-    for upper, lower in zip(rings, rings[1:]):
-        if len(upper) == 1:
-            faces += [(upper[0], lower[(i + 1) % radial], lower[i]) for i in range(radial)]
-        elif len(lower) == 1:
-            faces += [(lower[0], upper[i], upper[(i + 1) % radial]) for i in range(radial)]
-        else:
-            for i in range(radial):
-                j = (i + 1) % radial
-                faces.append((upper[i], upper[j], lower[j], lower[i]))
-    return verts, faces
-
-
-def capsule_profile(z_top, z_bot, r, body_rings, cap_rings):
-    prof = []
-    for i in range(cap_rings + 1):
-        a = math.pi / 2.0 * (1.0 - i / cap_rings)
-        prof.append((r * math.cos(a), z_top + r * math.sin(a)))
-    for i in range(1, body_rings):
-        prof.append((r, z_top + (z_bot - z_top) * i / body_rings))
-    for i in range(cap_rings + 1):
-        a = -math.pi / 2.0 * (i / cap_rings)
-        prof.append((r * math.cos(a), z_bot + r * math.sin(a)))
-    return prof
-
-
-def sphere_profile(cz, r, rings):
-    return [(r * math.cos(math.pi / 2.0 - math.pi * i / rings),
-             cz + r * math.sin(math.pi / 2.0 - math.pi * i / rings))
-            for i in range(rings + 1)]
-
-
-def add_geom(bm, verts, faces, offset=Vector((0, 0, 0))):
-    bverts = [bm.verts.new(v + offset) for v in verts]
-    for f in faces:
-        try:
-            bm.faces.new([bverts[i] for i in f])
-        except ValueError:
-            pass  # coincident face at a pole
 
 
 # =============================================================================
@@ -208,62 +157,100 @@ def add_geom(bm, verts, faces, offset=Vector((0, 0, 0))):
 def wipe():
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete(use_global=False)
-    for block in (bpy.data.meshes, bpy.data.armatures, bpy.data.objects,
-                  bpy.data.materials, bpy.data.cameras, bpy.data.lights):
+    for block in (bpy.data.meshes, bpy.data.metaballs, bpy.data.armatures,
+                  bpy.data.objects, bpy.data.materials, bpy.data.cameras,
+                  bpy.data.lights):
         for item in list(block):
             block.remove(item)
 
 
-def build_mesh():
-    bm = bmesh.new()
+def _to_mesh(obj):
+    """Convert a metaball object to a mesh and return the resulting object."""
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.convert(target="MESH")
+    return bpy.context.view_layer.objects.active
 
-    cz = (TORSO_Z0 + TORSO_Z1) / 2.0
-    cube = bmesh.ops.create_cube(bm, size=1.0)["verts"]
-    bmesh.ops.scale(bm, vec=Vector((TORSO_D, TORSO_W, TORSO_Z1 - TORSO_Z0)), verts=cube)
-    bmesh.ops.translate(bm, vec=Vector((0.0, 0.0, cz)), verts=cube)
-    bmesh.ops.bevel(bm, geom=bm.edges[:] + bm.verts[:], offset=TORSO_BEVEL,
-                    segments=TORSO_BEVEL_SEGS, profile=0.5, affect="EDGES",
-                    clamp_overlap=True)
 
-    v, f = revolve(sphere_profile(HEAD_CZ, HEAD_D / 2.0, HEAD_RINGS), HEAD_RADIAL)
-    add_geom(bm, v, f)
+def calibrate():
+    """Measure how far inside its element radius a metaball surface actually forms.
+
+    Returns the factor to divide radii by. Doing this rather than hard-coding a fudge
+    means threshold and stiffness stay free to tune without breaking every dimension.
+    """
+    mb = bpy.data.metaballs.new("Cal")
+    mb.resolution, mb.threshold = 0.25, MBALL_THRESHOLD
+    obj = bpy.data.objects.new("Cal", mb)
+    bpy.context.collection.objects.link(obj)
+    e = mb.elements.new()
+    e.type, e.co, e.radius, e.stiffness = "BALL", (0, 0, 0), 10.0, MBALL_STIFFNESS
+
+    mesh_obj = _to_mesh(obj)
+    actual = max(v.co.length for v in mesh_obj.data.vertices)
+    bpy.data.objects.remove(mesh_obj, do_unlink=True)
+    return actual / 10.0
+
+
+def build_body(gain):
+    """Torso + arms + legs as one smooth metaball union. No head."""
+    mb = bpy.data.metaballs.new("Body")
+    mb.resolution, mb.render_resolution = MBALL_RESOLUTION, MBALL_RESOLUTION
+    mb.threshold = MBALL_THRESHOLD
+    obj = bpy.data.objects.new("Body", mb)
+    bpy.context.collection.objects.link(obj)
+
+    def elem(kind, co, radius, size=None, direction=None):
+        e = mb.elements.new()
+        e.type, e.co = kind, co
+        e.radius, e.stiffness = radius / gain, MBALL_STIFFNESS
+        if size:
+            e.size_x, e.size_y, e.size_z = size
+        if direction:
+            e.rotation = Vector((1.0, 0.0, 0.0)).rotation_difference(direction)
+        return e
+
+    # Torso. A CUBE element is a rounded box: size_* is the flat core, radius the
+    # rounding around it, so the two together make the slab.
+    round_r = TORSO_D / 2.0 * 0.9
+    core = Vector((max(TORSO_D / 2.0 - round_r, 0.1),
+                   max(TORSO_W / 2.0 - round_r, 0.1),
+                   max((TORSO_Z1 - TORSO_Z0) / 2.0 - round_r, 0.1)))
+    elem("CUBE", (0.0, 0.0, (TORSO_Z0 + TORSO_Z1) / 2.0), round_r, size=core)
 
     for sy in (-1.0, 1.0):
-        a, b = arm_segment(sy)
-        length = (b - a).length
-        v, f = revolve(capsule_profile(0.0, -length, ARM_D / 2.0,
-                                       LIMB_BODY_RINGS, LIMB_CAP_RINGS), LIMB_RADIAL)
-        # Built vertically then swung onto the leaning axis.
-        rot = Vector((0.0, 0.0, -1.0)).rotation_difference(b - a).to_matrix()
-        add_geom(bm, [rot @ p for p in v], f, a)
+        for (a, b), r in ((arm_segment(sy), ARM_D / 2.0), (leg_segment(sy), LEG_D / 2.0)):
+            d = b - a
+            elem("CAPSULE", (a + b) / 2.0, r,
+                 size=(d.length / 2.0, 0.0, 0.0), direction=d.normalized())
 
-        v, f = revolve(capsule_profile(HIP[2], FOOT_Z, LEG_D / 2.0,
-                                       LIMB_BODY_RINGS, LIMB_CAP_RINGS), LIMB_RADIAL)
-        add_geom(bm, v, f, Vector((0.0, sy * HIP[1], 0.0)))
+    return _to_mesh(obj)
 
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-    me = bpy.data.meshes.new("BlobMesh")
+
+def build_head():
+    """The head is an ordinary sphere, deliberately OUTSIDE the metaball field: put it
+    in the field and it welds to the shoulders, and the reference's head is clearly a
+    separate ball."""
+    bm = bmesh.new()
+    bmesh.ops.create_uvsphere(bm, u_segments=HEAD_RADIAL, v_segments=HEAD_RINGS,
+                              radius=HEAD_D / 2.0)
+    bmesh.ops.translate(bm, vec=Vector((0.0, 0.0, HEAD_CZ)), verts=bm.verts[:])
+    me = bpy.data.meshes.new("Head")
     bm.to_mesh(me)
     bm.free()
-
-    obj = bpy.data.objects.new("BlobMesh", me)
+    obj = bpy.data.objects.new("Head", me)
     bpy.context.collection.objects.link(obj)
     return obj
 
 
-def fuse(obj):
-    """Voxel-remesh the intersecting primitives into one continuous skin, then
-    smooth the fusion seams and decimate back to budget."""
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-
-    rem = obj.modifiers.new("Remesh", "REMESH")
-    rem.mode, rem.voxel_size = "VOXEL", VOXEL_SIZE
-    bpy.ops.object.modifier_apply(modifier=rem.name)
-
-    smo = obj.modifiers.new("Smooth", "SMOOTH")
-    smo.factor, smo.iterations = SMOOTH_FACTOR, SMOOTH_REPEAT
-    bpy.ops.object.modifier_apply(modifier=smo.name)
+def assemble(body, head):
+    bpy.ops.object.select_all(action="DESELECT")
+    body.select_set(True)
+    head.select_set(True)
+    bpy.context.view_layer.objects.active = body
+    bpy.ops.object.join()
+    obj = bpy.context.view_layer.objects.active
+    obj.name = "BlobMesh"
 
     tris = sum(len(p.vertices) - 2 for p in obj.data.polygons)
     if tris > TARGET_TRIS:
@@ -271,8 +258,8 @@ def fuse(obj):
         dec.decimate_type, dec.ratio = "COLLAPSE", TARGET_TRIS / float(tris)
         bpy.ops.object.modifier_apply(modifier=dec.name)
 
-    # Voxel surface extraction pulls the skin slightly inside the source primitives,
-    # which lifts the feet off z=0. Drop the whole mesh back onto the ground plane.
+    # The metaball surface forms inside its elements, which lifts the feet off the
+    # floor. Drop the whole figure back onto z = 0.
     lift = min(v.co.z for v in obj.data.vertices)
     for v in obj.data.vertices:
         v.co.z -= lift
@@ -310,9 +297,9 @@ def build_armature():
         if parent:
             b.parent = arm_data.edit_bones[parent]
             b.use_connect = b.head == b.parent.tail
-        # Explicit roll: put local X on world Y for EVERY bone, so a pitch is
-        # rotation about local X regardless of which way the bone points. Blender's
-        # automatic roll does not do this and it twisted the legs.
+        # Explicit roll: put local X on world Y for EVERY bone, so pitch is rotation
+        # about local X whichever way the bone points. Blender's automatic roll does
+        # not do this and it twisted the legs.
         d = (b.tail - b.head).normalized()
         b.align_roll(Vector((0.0, 1.0, 0.0)).cross(d))
 
@@ -328,7 +315,6 @@ def joint_blend(z, joint_z, band):
 
 
 def part_weights(name, p):
-    """Bone weights a single analytic part would assign to point p."""
     if name == "torso":
         return {"Spine": 1.0}
     if name == "head":
@@ -344,14 +330,14 @@ def part_weights(name, p):
 
 
 def assign_weights(mesh_obj, arm_obj):
-    """Skin the fused mesh from the analytic body.
+    """Skin from the analytic body rather than by bone heat.
 
-    Bone heat is not used: after fusion there are no part boundaries left for it to
-    respect, the head/torso junction would smear, and the torso is a rigid slab that
-    must not deform at all. Instead every vertex is classified against the ORIGINAL
-    primitives by signed distance -- which the remesh cannot disturb -- and the two
-    nearest parts are cross-faded over PART_BLEND cm so the fused junctions deform
-    smoothly instead of snapping at a seam.
+    Metaball meshing produces topology with no relationship to the parts that made it,
+    and the torso is a slab that must not deform. So every vertex is classified by
+    signed distance to the ORIGINAL primitives and the two nearest parts cross-fade
+    over PART_BLEND cm. Head and torso are excluded from that cross-fade -- they are
+    separate islands with air between them, and blending would drag the torso's top
+    around whenever the head moved.
     """
     parts = body_parts()
     groups = {name: mesh_obj.vertex_groups.new(name=name) for name, _, _, _ in BONES}
@@ -362,9 +348,9 @@ def assign_weights(mesh_obj, arm_obj):
         (d1, n1), (d2, n2) = ds[0], ds[1]
 
         w = dict(part_weights(n1, p))
-        gap = d2 - d1
-        if gap < PART_BLEND:
-            t = 0.5 + 0.5 * (gap / PART_BLEND)          # 0.5 at a tie -> 1.0 far apart
+        detached = {n1, n2} == {"head", "torso"}
+        if not detached and d2 - d1 < PART_BLEND:
+            t = 0.5 + 0.5 * ((d2 - d1) / PART_BLEND)
             w = {k: val * t for k, val in w.items()}
             for k, val in part_weights(n2, p).items():
                 w[k] = w.get(k, 0.0) + val * (1.0 - t)
@@ -425,8 +411,8 @@ def setup_render():
 
 
 def aim_camera(cam, yaw_deg, dist=330.0, target_z=50.0):
-    """yaw 0 == facing the camera. The figure faces +X (UE actor-forward) and its
-    arms spread along Y, so starting the camera on -Y sights straight down the arms."""
+    """yaw 0 == facing the camera. The figure faces +X (UE actor-forward) and its arms
+    spread along Y, so starting the camera on -Y sights straight down the arms."""
     a = math.radians(yaw_deg)
     cam.location = (dist * math.cos(a), dist * math.sin(a), target_z + 42.0)
     d = Vector((0, 0, target_z)) - Vector(cam.location)
@@ -462,30 +448,33 @@ def main():
     bpy.context.scene.unit_settings.system = "METRIC"
     bpy.context.scene.unit_settings.scale_length = 0.01
 
-    mesh_obj = fuse(build_mesh())
+    gain = calibrate()
+    print("GEN_MBALL_GAIN: %.4f" % gain)
+
+    mesh_obj = assemble(build_body(gain), build_head())
     arm_obj = build_armature()
     assign_weights(mesh_obj, arm_obj)
     mesh_obj.data.materials.append(make_material())
 
+    zs = [v.co.z for v in mesh_obj.data.vertices]
+    ys = [abs(v.co.y) for v in mesh_obj.data.vertices]
     print("GEN_VERTS:", len(mesh_obj.data.vertices))
     print("GEN_TRIS:", sum(len(p.vertices) - 2 for p in mesh_obj.data.polygons))
-    print("GEN_SHELLS:", len(mesh_obj.data.polygons))
-    zs = [v.co.z for v in mesh_obj.data.vertices]
     print("GEN_HEIGHT: %.2f to %.2f" % (min(zs), max(zs)))
+    print("GEN_HALFWIDTH: %.2f" % max(ys))
 
     cam = setup_render()
     for label, yaw in (("front", 0), ("three_quarter", 38), ("side", 90), ("back", 180)):
         aim_camera(cam, yaw)
         render_to(os.path.join(outdir, "preview_" + label))
 
-    # Bend test. Straight limbs prove nothing about a rig.
     pose(arm_obj, {"UpperArmL": -55, "ForeArmL": -50, "UpperArmR": 38, "ForeArmR": -28,
                    "ThighL": 42, "ShinL": -60, "ThighR": -30, "ShinR": -18})
     aim_camera(cam, 34)
     render_to(os.path.join(outdir, "preview_bend"))
 
-    # Walk-ish pose from the SIDE. A forward/back limb swing is almost invisible
-    # head-on, which made the first walk render look like the pose had not applied.
+    # Walk pose from the SIDE. A forward/back limb swing is almost invisible head-on,
+    # which made an earlier walk render look like the pose had not applied at all.
     pose(arm_obj, {"UpperArmL": -28, "ForeArmL": -18, "UpperArmR": 28, "ForeArmR": -10,
                    "ThighL": 30, "ShinL": -35, "ThighR": -22, "ShinR": -8})
     aim_camera(cam, 90)
