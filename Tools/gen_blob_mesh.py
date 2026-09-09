@@ -7,13 +7,22 @@ constants below, so changing a proportion is a re-run, not a remodel.
 
 Writes <outdir>/SK_Blob.fbx plus preview renders.
 
-Two facts about the Blender -> Unreal FBX trip, both established by the Step 0 probe
-and both easy to get wrong:
+THE BODY IS ONE CONTINUOUS SURFACE. The parts are built as separate primitives, then
+voxel-remeshed into a single fused skin so arms and legs flow out of the torso instead
+of being pills parked beside it. That fusion destroys any notion of "which part is this
+vertex", so skin weights are computed from the SIGNED DISTANCE to the original analytic
+primitives, which survives the remesh exactly. See assign_weights().
+
+Three facts about the Blender -> Unreal FBX trip, all established the hard way:
 
   1. Build numerically in UE centimetres AND declare unit_settings.scale_length = 0.01,
      then export with apply_unit_scale=True. Getting this wrong lands the mesh 100x out.
   2. The armature OBJECT name becomes the root bone name in UE, sitting above every bone
      declared here. It is named "Root" for that reason.
+  3. Blender bones point along their own local +Y. Blender's automatic roll for a bone
+     pointing straight down puts local X somewhere arbitrary, so a "pitch" rotation
+     twisted the legs about their own axis. Every bone here gets an EXPLICIT roll that
+     puts local X on world Y, so pitch is rotation about local X for every bone alike.
 
 Design spec: Docs/superpowers/specs/2026-09-09-player-skeletal-rework-design.md
 """
@@ -22,62 +31,114 @@ import bmesh
 import math
 import os
 import sys
-from mathutils import Vector, Matrix
+from mathutils import Vector
 
 # =============================================================================
 # PROPORTIONS -- the whole design surface. Everything below is derived.
 # Units are UE centimetres, z = 0 at the feet.
 # =============================================================================
 
-TOTAL_H = 97.0
+TOTAL_H = 95.0
 
-# Torso: a rounded slab, not an ellipsoid.
-TORSO_Z0, TORSO_Z1 = 33.0, 73.0
-TORSO_W, TORSO_D = 26.0, 19.0
-TORSO_BEVEL = 6.0
-TORSO_BEVEL_SEGS = 4
+# Torso: a rounded slab. The bevel is most of the depth, which is what stops it
+# reading as a box with tidied edges.
+TORSO_Z0, TORSO_Z1 = 36.0, 73.0
+TORSO_W, TORSO_D = 23.0, 16.0
+TORSO_BEVEL = 7.0                  # max is TORSO_D/2; at 7 of 8 the sides are near-round
+TORSO_BEVEL_SEGS = 6
 
-# Head: a sphere, visibly detached.
+# Head: a sphere sitting ON the torso, not floating above it. Its underside is at
+# exactly TORSO_Z1 so the remesh fuses the two into one form.
 HEAD_D = 22.0
-HEAD_CZ = 86.0
+HEAD_CZ = 84.0
 
-# Arms. Bone chain shoulder -> elbow -> wrist; the mesh is a capsule between the
-# shoulder and wrist points, so its hemispherical cap is centred ON the shoulder
-# joint and pivoting leaves no gap in the torso.
+# Arms. Bone chain shoulder -> elbow -> wrist. The mesh capsule spans shoulder to
+# wrist, so its top hemisphere is centred ON the shoulder joint and pivoting cannot
+# tear a hole in the torso.
 ARM_D = 7.5
-SHOULDER = (0.0, 16.0, 68.0)   # y is mirrored per side; 1.25x torso half-width so the
-                               # arm reads as its own tube instead of a bump on the slab
-ELBOW_Z = 50.0
-WRIST_Z = 33.0
+SHOULDER = (0.0, 15.0, 68.0)       # BONE position, vertical. The mesh capsule leans:
+ARM_TOP_Y, ARM_BOT_Y = 14.0, 18.0  # tucked into the torso at the shoulder, swinging clear
+                                   # of it by the wrist -- connected at the top, a distinct
+                                   # tube below, which is how the reference reads
+ELBOW_Z = 52.0
+WRIST_Z = 36.0
 
-# Legs. DEVIATION FROM SPEC S4, deliberate: the spec's chain was hip 33 -> knee 17
-# -> ankle 0. Putting the ankle at 0 centres the capsule's bottom hemisphere on the
-# ground plane, so the foot sinks one radius (5 cm) BELOW it. The foot point is
-# therefore lifted to z 5, which lands the mesh bottom exactly on z 0. Visible leg
-# length is still 33 (torso bottom to ground); only the bone chain shortened, 16+17
-# -> 14+14.
+# Legs. The foot point sits one radius above the ground so the capsule's bottom cap
+# lands exactly on z = 0 rather than 5 cm underneath it.
 LEG_D = 10.0
-HIP = (0.0, 6.0, 33.0)
-KNEE_Z = 19.0
+HIP = (0.0, 7.0, 36.0)
+KNEE_Z = 20.0
 FOOT_Z = 5.0
 
-PELVIS_Z = 33.0
+PELVIS_Z = 36.0
 
-# Tessellation. Budget ~1500 tris.
-LIMB_RADIAL = 10
-LIMB_BODY_RINGS = 6
-LIMB_CAP_RINGS = 3
-HEAD_RADIAL = 12
-HEAD_RINGS = 8
+# Fusion + budget.
+VOXEL_SIZE = 1.1                   # at 2.2 the remesh webbed the arms to the torso and
+                                   # welded the legs together; the gaps need resolving
+SMOOTH_FACTOR, SMOOTH_REPEAT = 0.3, 1   # two passes at 0.5 closed the gaps again
+TARGET_TRIS = 2200
 
-# Skin weights: the blend band across a joint, as a fraction of the shorter
-# adjacent segment. Wider = smoother curve, mushier joint.
-JOINT_BLEND = 0.25
+# Tessellation of the source primitives (pre-remesh; only affects fusion fidelity).
+LIMB_RADIAL, LIMB_BODY_RINGS, LIMB_CAP_RINGS = 12, 6, 4
+HEAD_RADIAL, HEAD_RINGS = 16, 10
 
-# Preview material -- MI_Blob_Mint's teal, at the spec's target shading.
+# Skin weights.
+JOINT_BLEND = 0.25                 # blend band across a joint, as a fraction of the
+                                   # shorter adjacent segment
+PART_BLEND = 3.0                   # cm over which one part's weights cross into another's.
+                                   # At 5 the torso near the shoulder took enough arm weight
+                                   # to drag out as a web when the arm swung.
+
+# Preview material -- MI_Blob_Mint's teal at the spec's target shading.
 SKIN_RGB = (0.06, 0.62, 0.55)
-SKIN_ROUGH = 0.18
-SKIN_METAL = 0.1
+SKIN_ROUGH, SKIN_METAL = 0.18, 0.1
+
+
+# =============================================================================
+# Signed distance functions -- the analytic body, used for skinning after fusion
+# =============================================================================
+
+def sd_round_box(p, centre, half, r):
+    q = Vector((abs(p.x - centre.x) - half.x,
+                abs(p.y - centre.y) - half.y,
+                abs(p.z - centre.z) - half.z))
+    outside = Vector((max(q.x, 0.0), max(q.y, 0.0), max(q.z, 0.0))).length
+    return outside + min(max(q.x, max(q.y, q.z)), 0.0) - r
+
+
+def sd_sphere(p, centre, r):
+    return (p - centre).length - r
+
+
+def sd_capsule(p, a, b, r):
+    ab, ap = b - a, p - a
+    t = 0.0 if ab.length_squared < 1e-9 else min(1.0, max(0.0, ap.dot(ab) / ab.length_squared))
+    return (ap - ab * t).length - r
+
+
+def arm_segment(sy):
+    """The arm capsule's axis: tucked in at the shoulder, leaning out to the wrist."""
+    return (Vector((0.0, sy * ARM_TOP_Y, SHOULDER[2])),
+            Vector((0.0, sy * ARM_BOT_Y, WRIST_Z)))
+
+
+def body_parts():
+    """The analytic body. Each entry: (name, sdf callable)."""
+    torso_c = Vector((0.0, 0.0, (TORSO_Z0 + TORSO_Z1) / 2.0))
+    torso_h = Vector((TORSO_D / 2.0 - TORSO_BEVEL,
+                      TORSO_W / 2.0 - TORSO_BEVEL,
+                      (TORSO_Z1 - TORSO_Z0) / 2.0 - TORSO_BEVEL))
+    parts = [
+        ("torso", lambda p: sd_round_box(p, torso_c, torso_h, TORSO_BEVEL)),
+        ("head", lambda p: sd_sphere(p, Vector((0.0, 0.0, HEAD_CZ)), HEAD_D / 2.0)),
+    ]
+    for side, sy in (("L", -1.0), ("R", 1.0)):
+        a, b = arm_segment(sy)
+        parts.append(("arm" + side, lambda p, a=a, b=b: sd_capsule(p, a, b, ARM_D / 2.0)))
+        c = Vector((0.0, sy * HIP[1], HIP[2]))
+        d = Vector((0.0, sy * HIP[1], FOOT_Z))
+        parts.append(("leg" + side, lambda p, c=c, d=d: sd_capsule(p, c, d, LEG_D / 2.0)))
+    return parts
 
 
 # =============================================================================
@@ -85,12 +146,8 @@ SKIN_METAL = 0.1
 # =============================================================================
 
 def revolve(profile, radial):
-    """Revolve a (radius, z) profile around the z axis.
-
-    A profile point with radius 0 becomes a single pole vertex, which is what
-    makes this build both capsules and spheres without special-casing caps.
-    Returns (verts, faces) with outward-facing winding.
-    """
+    """Revolve a (radius, z) profile around z. A radius of 0 becomes a pole vertex,
+    which is what lets this build both capsules and spheres with no cap special case."""
     verts, rings = [], []
     for r, z in profile:
         if r <= 1e-9:
@@ -103,7 +160,6 @@ def revolve(profile, radial):
                 ring.append(len(verts))
                 verts.append(Vector((r * math.cos(a), r * math.sin(a), z)))
             rings.append(ring)
-
     faces = []
     for upper, lower in zip(rings, rings[1:]):
         if len(upper) == 1:
@@ -118,14 +174,13 @@ def revolve(profile, radial):
 
 
 def capsule_profile(z_top, z_bot, r, body_rings, cap_rings):
-    """Vertical capsule: hemisphere cap centred on z_top, tube, cap on z_bot."""
     prof = []
-    for i in range(cap_rings + 1):                       # top cap, pole first
+    for i in range(cap_rings + 1):
         a = math.pi / 2.0 * (1.0 - i / cap_rings)
         prof.append((r * math.cos(a), z_top + r * math.sin(a)))
-    for i in range(1, body_rings):                       # tube interior
+    for i in range(1, body_rings):
         prof.append((r, z_top + (z_bot - z_top) * i / body_rings))
-    for i in range(cap_rings + 1):                       # bottom cap, pole last
+    for i in range(cap_rings + 1):
         a = -math.pi / 2.0 * (i / cap_rings)
         prof.append((r * math.cos(a), z_bot + r * math.sin(a)))
     return prof
@@ -138,15 +193,12 @@ def sphere_profile(cz, r, rings):
 
 
 def add_geom(bm, verts, faces, offset=Vector((0, 0, 0))):
-    """Append verts/faces to a bmesh. Returns the BMVerts added, in order."""
     bverts = [bm.verts.new(v + offset) for v in verts]
-    bm.verts.index_update()
     for f in faces:
         try:
             bm.faces.new([bverts[i] for i in f])
         except ValueError:
-            pass  # duplicate face at a pole; harmless
-    return bverts
+            pass  # coincident face at a pole
 
 
 # =============================================================================
@@ -163,77 +215,91 @@ def wipe():
 
 
 def build_mesh():
-    """Build the body as one mesh. Returns (object, {part: [vertex indices]})."""
     bm = bmesh.new()
-    parts = {}
 
-    def record(name, bverts):
-        bm.verts.index_update()
-        parts[name] = [v.index for v in bverts]
-
-    # --- torso: bevelled box -------------------------------------------------
-    # bevel() deletes the source verts and returns new ones, so the torso is
-    # recorded by index range afterwards rather than by holding stale references.
     cz = (TORSO_Z0 + TORSO_Z1) / 2.0
     cube = bmesh.ops.create_cube(bm, size=1.0)["verts"]
     bmesh.ops.scale(bm, vec=Vector((TORSO_D, TORSO_W, TORSO_Z1 - TORSO_Z0)), verts=cube)
     bmesh.ops.translate(bm, vec=Vector((0.0, 0.0, cz)), verts=cube)
-    bmesh.ops.bevel(bm, geom=bm.edges[:] + bm.verts[:],
-                    offset=TORSO_BEVEL, segments=TORSO_BEVEL_SEGS,
-                    profile=0.5, affect="EDGES", clamp_overlap=True)
-    bm.verts.ensure_lookup_table()
-    bm.verts.index_update()
-    parts["torso"] = list(range(len(bm.verts)))   # nothing else built yet
+    bmesh.ops.bevel(bm, geom=bm.edges[:] + bm.verts[:], offset=TORSO_BEVEL,
+                    segments=TORSO_BEVEL_SEGS, profile=0.5, affect="EDGES",
+                    clamp_overlap=True)
 
-    # --- head ----------------------------------------------------------------
     v, f = revolve(sphere_profile(HEAD_CZ, HEAD_D / 2.0, HEAD_RINGS), HEAD_RADIAL)
-    record("head", add_geom(bm, v, f))
+    add_geom(bm, v, f)
 
-    # --- arms ----------------------------------------------------------------
-    for side, sy in (("L", -1.0), ("R", 1.0)):
-        prof = capsule_profile(SHOULDER[2], WRIST_Z, ARM_D / 2.0,
-                               LIMB_BODY_RINGS, LIMB_CAP_RINGS)
-        v, f = revolve(prof, LIMB_RADIAL)
-        record("arm" + side, add_geom(bm, v, f, Vector((0.0, sy * SHOULDER[1], 0.0))))
+    for sy in (-1.0, 1.0):
+        a, b = arm_segment(sy)
+        length = (b - a).length
+        v, f = revolve(capsule_profile(0.0, -length, ARM_D / 2.0,
+                                       LIMB_BODY_RINGS, LIMB_CAP_RINGS), LIMB_RADIAL)
+        # Built vertically then swung onto the leaning axis.
+        rot = Vector((0.0, 0.0, -1.0)).rotation_difference(b - a).to_matrix()
+        add_geom(bm, [rot @ p for p in v], f, a)
 
-    # --- legs ----------------------------------------------------------------
-    for side, sy in (("L", -1.0), ("R", 1.0)):
-        prof = capsule_profile(HIP[2], FOOT_Z, LEG_D / 2.0,
-                               LIMB_BODY_RINGS, LIMB_CAP_RINGS)
-        v, f = revolve(prof, LIMB_RADIAL)
-        record("leg" + side, add_geom(bm, v, f, Vector((0.0, sy * HIP[1], 0.0))))
+        v, f = revolve(capsule_profile(HIP[2], FOOT_Z, LEG_D / 2.0,
+                                       LIMB_BODY_RINGS, LIMB_CAP_RINGS), LIMB_RADIAL)
+        add_geom(bm, v, f, Vector((0.0, sy * HIP[1], 0.0)))
 
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     me = bpy.data.meshes.new("BlobMesh")
     bm.to_mesh(me)
     bm.free()
-    me.shade_smooth()
 
     obj = bpy.data.objects.new("BlobMesh", me)
     bpy.context.collection.objects.link(obj)
-    return obj, parts
+    return obj
+
+
+def fuse(obj):
+    """Voxel-remesh the intersecting primitives into one continuous skin, then
+    smooth the fusion seams and decimate back to budget."""
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+
+    rem = obj.modifiers.new("Remesh", "REMESH")
+    rem.mode, rem.voxel_size = "VOXEL", VOXEL_SIZE
+    bpy.ops.object.modifier_apply(modifier=rem.name)
+
+    smo = obj.modifiers.new("Smooth", "SMOOTH")
+    smo.factor, smo.iterations = SMOOTH_FACTOR, SMOOTH_REPEAT
+    bpy.ops.object.modifier_apply(modifier=smo.name)
+
+    tris = sum(len(p.vertices) - 2 for p in obj.data.polygons)
+    if tris > TARGET_TRIS:
+        dec = obj.modifiers.new("Decimate", "DECIMATE")
+        dec.decimate_type, dec.ratio = "COLLAPSE", TARGET_TRIS / float(tris)
+        bpy.ops.object.modifier_apply(modifier=dec.name)
+
+    # Voxel surface extraction pulls the skin slightly inside the source primitives,
+    # which lifts the feet off z=0. Drop the whole mesh back onto the ground plane.
+    lift = min(v.co.z for v in obj.data.vertices)
+    for v in obj.data.vertices:
+        v.co.z -= lift
+
+    obj.data.shade_smooth()
+    return obj
 
 
 BONES = [
-    # name,        head,                          tail,                        parent
-    ("Pelvis",     (0, 0, PELVIS_Z),              (0, 0, PELVIS_Z + 6),        None),
-    ("Spine",      (0, 0, TORSO_Z0),              (0, 0, TORSO_Z1),            "Pelvis"),
-    ("Head",       (0, 0, TORSO_Z1 + 2),          (0, 0, TOTAL_H),             "Spine"),
-    ("UpperArmL",  (0, -SHOULDER[1], SHOULDER[2]), (0, -SHOULDER[1], ELBOW_Z), "Spine"),
-    ("ForeArmL",   (0, -SHOULDER[1], ELBOW_Z),    (0, -SHOULDER[1], WRIST_Z),  "UpperArmL"),
-    ("UpperArmR",  (0, SHOULDER[1], SHOULDER[2]), (0, SHOULDER[1], ELBOW_Z),   "Spine"),
-    ("ForeArmR",   (0, SHOULDER[1], ELBOW_Z),     (0, SHOULDER[1], WRIST_Z),   "UpperArmR"),
-    ("ThighL",     (0, -HIP[1], HIP[2]),          (0, -HIP[1], KNEE_Z),        "Pelvis"),
-    ("ShinL",      (0, -HIP[1], KNEE_Z),          (0, -HIP[1], FOOT_Z),        "ThighL"),
-    ("ThighR",     (0, HIP[1], HIP[2]),           (0, HIP[1], KNEE_Z),         "Pelvis"),
-    ("ShinR",      (0, HIP[1], KNEE_Z),           (0, HIP[1], FOOT_Z),         "ThighR"),
+    # name,       head,                           tail,                          parent
+    ("Pelvis",    (0, 0, PELVIS_Z),               (0, 0, PELVIS_Z + 6),          None),
+    ("Spine",     (0, 0, TORSO_Z0),               (0, 0, TORSO_Z1),              "Pelvis"),
+    ("Head",      (0, 0, TORSO_Z1),               (0, 0, TOTAL_H),               "Spine"),
+    ("UpperArmL", (0, -SHOULDER[1], SHOULDER[2]), (0, -SHOULDER[1], ELBOW_Z),    "Spine"),
+    ("ForeArmL",  (0, -SHOULDER[1], ELBOW_Z),     (0, -SHOULDER[1], WRIST_Z),    "UpperArmL"),
+    ("UpperArmR", (0, SHOULDER[1], SHOULDER[2]),  (0, SHOULDER[1], ELBOW_Z),     "Spine"),
+    ("ForeArmR",  (0, SHOULDER[1], ELBOW_Z),      (0, SHOULDER[1], WRIST_Z),     "UpperArmR"),
+    ("ThighL",    (0, -HIP[1], HIP[2]),           (0, -HIP[1], KNEE_Z),          "Pelvis"),
+    ("ShinL",     (0, -HIP[1], KNEE_Z),           (0, -HIP[1], FOOT_Z),          "ThighL"),
+    ("ThighR",    (0, HIP[1], HIP[2]),            (0, HIP[1], KNEE_Z),           "Pelvis"),
+    ("ShinR",     (0, HIP[1], KNEE_Z),            (0, HIP[1], FOOT_Z),           "ThighR"),
 ]
 
 
 def build_armature():
     arm_data = bpy.data.armatures.new("BlobArmature")
-    # This object name becomes the UE root bone -- see module docstring.
-    arm_obj = bpy.data.objects.new("Root", arm_data)
+    arm_obj = bpy.data.objects.new("Root", arm_data)   # -> UE root bone; see docstring
     bpy.context.collection.objects.link(arm_obj)
     bpy.context.view_layer.objects.active = arm_obj
     bpy.ops.object.mode_set(mode="EDIT")
@@ -243,60 +309,82 @@ def build_armature():
         b.head, b.tail = Vector(head), Vector(tail)
         if parent:
             b.parent = arm_data.edit_bones[parent]
-            b.use_connect = Vector(head) == Vector(arm_data.edit_bones[parent].tail)
+            b.use_connect = b.head == b.parent.tail
+        # Explicit roll: put local X on world Y for EVERY bone, so a pitch is
+        # rotation about local X regardless of which way the bone points. Blender's
+        # automatic roll does not do this and it twisted the legs.
+        d = (b.tail - b.head).normalized()
+        b.align_roll(Vector((0.0, 1.0, 0.0)).cross(d))
 
     bpy.ops.object.mode_set(mode="OBJECT")
     return arm_obj
 
 
-def blend(z, joint_z, band):
-    """1.0 fully upper bone, 0.0 fully lower bone, linear across the band."""
+def joint_blend(z, joint_z, band):
+    """1.0 = fully the upper bone, 0.0 = fully the lower one, linear across the band."""
     if band <= 1e-6:
         return 1.0 if z >= joint_z else 0.0
     return min(1.0, max(0.0, (z - (joint_z - band / 2.0)) / band))
 
 
-def skin(mesh_obj, arm_obj, parts):
-    """Explicit weights. Bone heat is NOT used.
+def part_weights(name, p):
+    """Bone weights a single analytic part would assign to point p."""
+    if name == "torso":
+        return {"Spine": 1.0}
+    if name == "head":
+        return {"Head": 1.0}
+    side = name[-1]
+    if name.startswith("arm"):
+        band = JOINT_BLEND * min(SHOULDER[2] - ELBOW_Z, ELBOW_Z - WRIST_Z)
+        w = joint_blend(p.z, ELBOW_Z, band)
+        return {"UpperArm" + side: w, "ForeArm" + side: 1.0 - w}
+    band = JOINT_BLEND * min(HIP[2] - KNEE_Z, KNEE_Z - FOOT_Z)
+    w = joint_blend(p.z, KNEE_Z, band)
+    return {"Thigh" + side: w, "Shin" + side: 1.0 - w}
 
-    The head is a disconnected island, where heat weighting is unreliable, and the
-    torso is a rigid slab that must not deform at all. Both are hard-assigned. The
-    limbs get a linear falloff whose width is a stated design parameter rather than
-    whatever the solver happened to pick.
+
+def assign_weights(mesh_obj, arm_obj):
+    """Skin the fused mesh from the analytic body.
+
+    Bone heat is not used: after fusion there are no part boundaries left for it to
+    respect, the head/torso junction would smear, and the torso is a rigid slab that
+    must not deform at all. Instead every vertex is classified against the ORIGINAL
+    primitives by signed distance -- which the remesh cannot disturb -- and the two
+    nearest parts are cross-faded over PART_BLEND cm so the fused junctions deform
+    smoothly instead of snapping at a seam.
     """
+    parts = body_parts()
     groups = {name: mesh_obj.vertex_groups.new(name=name) for name, _, _, _ in BONES}
-    co = mesh_obj.data.vertices
 
-    for i in parts["torso"]:
-        groups["Spine"].add([i], 1.0, "REPLACE")
-    for i in parts["head"]:
-        groups["Head"].add([i], 1.0, "REPLACE")
+    for v in mesh_obj.data.vertices:
+        p = v.co
+        ds = sorted(((sdf(p), name) for name, sdf in parts), key=lambda t: t[0])
+        (d1, n1), (d2, n2) = ds[0], ds[1]
 
-    arm_band = JOINT_BLEND * min(SHOULDER[2] - ELBOW_Z, ELBOW_Z - WRIST_Z)
-    leg_band = JOINT_BLEND * min(HIP[2] - KNEE_Z, KNEE_Z - FOOT_Z)
+        w = dict(part_weights(n1, p))
+        gap = d2 - d1
+        if gap < PART_BLEND:
+            t = 0.5 + 0.5 * (gap / PART_BLEND)          # 0.5 at a tie -> 1.0 far apart
+            w = {k: val * t for k, val in w.items()}
+            for k, val in part_weights(n2, p).items():
+                w[k] = w.get(k, 0.0) + val * (1.0 - t)
 
-    for side in ("L", "R"):
-        for i in parts["arm" + side]:
-            w = blend(co[i].co.z, ELBOW_Z, arm_band)
-            groups["UpperArm" + side].add([i], w, "REPLACE")
-            groups["ForeArm" + side].add([i], 1.0 - w, "REPLACE")
-        for i in parts["leg" + side]:
-            w = blend(co[i].co.z, KNEE_Z, leg_band)
-            groups["Thigh" + side].add([i], w, "REPLACE")
-            groups["Shin" + side].add([i], 1.0 - w, "REPLACE")
+        total = sum(w.values()) or 1.0
+        for bone, val in w.items():
+            if val > 1e-4:
+                groups[bone].add([v.index], val / total, "REPLACE")
 
     mesh_obj.parent = arm_obj
-    mod = mesh_obj.modifiers.new("Armature", "ARMATURE")
-    mod.object = arm_obj
+    mesh_obj.modifiers.new("Armature", "ARMATURE").object = arm_obj
 
 
 def make_material():
     mat = bpy.data.materials.new("M_BlobPreview")
     mat.use_nodes = True
-    bsdf = mat.node_tree.nodes["Principled BSDF"]
-    bsdf.inputs["Base Color"].default_value = (*SKIN_RGB, 1.0)
-    bsdf.inputs["Roughness"].default_value = SKIN_ROUGH
-    bsdf.inputs["Metallic"].default_value = SKIN_METAL
+    b = mat.node_tree.nodes["Principled BSDF"]
+    b.inputs["Base Color"].default_value = (*SKIN_RGB, 1.0)
+    b.inputs["Roughness"].default_value = SKIN_ROUGH
+    b.inputs["Metallic"].default_value = SKIN_METAL
     return mat
 
 
@@ -312,24 +400,19 @@ def setup_render():
             break
         except TypeError:
             continue
-    scene.render.resolution_x = 620
-    scene.render.resolution_y = 780
-    scene.render.film_transparent = False
+    scene.render.resolution_x, scene.render.resolution_y = 620, 780
     scene.world = bpy.data.worlds.new("W")
     scene.world.use_nodes = True
     scene.world.node_tree.nodes["Background"].inputs[0].default_value = (.92, .93, .93, 1)
-    scene.world.node_tree.nodes["Background"].inputs[1].default_value = 1.0
 
     key = bpy.data.objects.new("Key", bpy.data.lights.new("Key", "AREA"))
-    key.data.energy = 2.2e6
-    key.data.size = 300
+    key.data.energy, key.data.size = 2.2e6, 300
     key.location = (-260, -220, 300)
     key.rotation_euler = (math.radians(48), 0, math.radians(-42))
     bpy.context.collection.objects.link(key)
 
     fill = bpy.data.objects.new("Fill", bpy.data.lights.new("Fill", "AREA"))
-    fill.data.energy = 5e5
-    fill.data.size = 500
+    fill.data.energy, fill.data.size = 5e5, 500
     fill.location = (300, -160, 120)
     fill.rotation_euler = (math.radians(80), 0, math.radians(62))
     bpy.context.collection.objects.link(fill)
@@ -341,17 +424,13 @@ def setup_render():
     return cam
 
 
-def aim_camera(cam, yaw_deg, dist=330.0, target_z=52.0):
-    """yaw 0 == looking at the character's face.
-
-    The figure faces +X (UE actor-forward) and its arms spread along Y, so the
-    camera starts on +X. Starting it on -Y sights straight down the arms and
-    renders a side view labelled "front".
-    """
+def aim_camera(cam, yaw_deg, dist=330.0, target_z=50.0):
+    """yaw 0 == facing the camera. The figure faces +X (UE actor-forward) and its
+    arms spread along Y, so starting the camera on -Y sights straight down the arms."""
     a = math.radians(yaw_deg)
-    cam.location = (dist * math.cos(a), dist * math.sin(a), target_z + 44.0)
-    direction = Vector((0, 0, target_z)) - Vector(cam.location)
-    cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+    cam.location = (dist * math.cos(a), dist * math.sin(a), target_z + 42.0)
+    d = Vector((0, 0, target_z)) - Vector(cam.location)
+    cam.rotation_euler = d.to_track_quat("-Z", "Y").to_euler()
 
 
 def render_to(path):
@@ -360,11 +439,8 @@ def render_to(path):
 
 
 def pose(arm_obj, angles):
-    """angles: {bone_name: pitch_degrees}.
-
-    Blender bones point along their own local +Y, so pitch is rotation about local X.
-    Rotating about Y twists the limb around its own axis and looks like nothing happened.
-    """
+    """angles: {bone_name: pitch_degrees}. Every bone's roll was set so local X is
+    world Y, so pitch is rotation about local X for all of them."""
     bpy.context.view_layer.objects.active = arm_obj
     bpy.ops.object.mode_set(mode="POSE")
     for pb in arm_obj.pose.bones:
@@ -386,15 +462,14 @@ def main():
     bpy.context.scene.unit_settings.system = "METRIC"
     bpy.context.scene.unit_settings.scale_length = 0.01
 
-    mesh_obj, parts = build_mesh()
+    mesh_obj = fuse(build_mesh())
     arm_obj = build_armature()
-    skin(mesh_obj, arm_obj, parts)
+    assign_weights(mesh_obj, arm_obj)
     mesh_obj.data.materials.append(make_material())
 
-    tris = sum(len(p.vertices) - 2 for p in mesh_obj.data.polygons)
     print("GEN_VERTS:", len(mesh_obj.data.vertices))
-    print("GEN_TRIS:", tris)
-    print("GEN_BONES:", [b.name for b in arm_obj.data.bones])
+    print("GEN_TRIS:", sum(len(p.vertices) - 2 for p in mesh_obj.data.polygons))
+    print("GEN_SHELLS:", len(mesh_obj.data.polygons))
     zs = [v.co.z for v in mesh_obj.data.vertices]
     print("GEN_HEIGHT: %.2f to %.2f" % (min(zs), max(zs)))
 
@@ -403,15 +478,18 @@ def main():
         aim_camera(cam, yaw)
         render_to(os.path.join(outdir, "preview_" + label))
 
-    # Bend test: the whole point of the rig. Straight limbs prove nothing.
-    pose(arm_obj, {
-        "UpperArmL": -55, "ForeArmL": -50,
-        "UpperArmR": 38, "ForeArmR": -28,
-        "ThighL": 42, "ShinL": -60,
-        "ThighR": -30, "ShinR": -18,
-    })
+    # Bend test. Straight limbs prove nothing about a rig.
+    pose(arm_obj, {"UpperArmL": -55, "ForeArmL": -50, "UpperArmR": 38, "ForeArmR": -28,
+                   "ThighL": 42, "ShinL": -60, "ThighR": -30, "ShinR": -18})
     aim_camera(cam, 34)
     render_to(os.path.join(outdir, "preview_bend"))
+
+    # Walk-ish pose from the SIDE. A forward/back limb swing is almost invisible
+    # head-on, which made the first walk render look like the pose had not applied.
+    pose(arm_obj, {"UpperArmL": -28, "ForeArmL": -18, "UpperArmR": 28, "ForeArmR": -10,
+                   "ThighL": 30, "ShinL": -35, "ThighR": -22, "ShinR": -8})
+    aim_camera(cam, 90)
+    render_to(os.path.join(outdir, "preview_walk"))
     pose(arm_obj, {})
 
     fbx = os.path.join(outdir, "SK_Blob.fbx")
@@ -420,20 +498,11 @@ def main():
     arm_obj.select_set(True)
     bpy.context.view_layer.objects.active = arm_obj
     bpy.ops.export_scene.fbx(
-        filepath=fbx,
-        use_selection=True,
-        object_types={"ARMATURE", "MESH"},
-        global_scale=1.0,
-        apply_unit_scale=True,
-        apply_scale_options="FBX_SCALE_NONE",
-        axis_forward="-Y",
-        axis_up="Z",
-        add_leaf_bones=False,
-        use_armature_deform_only=True,
-        bake_anim=False,
-        mesh_smooth_type="FACE",
-        path_mode="COPY",
-    )
+        filepath=fbx, use_selection=True, object_types={"ARMATURE", "MESH"},
+        global_scale=1.0, apply_unit_scale=True, apply_scale_options="FBX_SCALE_NONE",
+        axis_forward="-Y", axis_up="Z", add_leaf_bones=False,
+        use_armature_deform_only=False,   # keep Pelvis, which carries no weights
+        bake_anim=False, mesh_smooth_type="FACE", path_mode="COPY")
     print("GEN_FBX:", fbx, os.path.getsize(fbx))
 
 

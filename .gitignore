@@ -43,5 +43,3 @@ refimages/
 .claude/settings.local.json
 .mcp.json
 
-# Step-0 import probe -- throwaway, delete in the content browser
-Content/Proto/Meshes/Probe/
