@@ -27,8 +27,9 @@ Separate islands cannot stretch. They stay looking connected because of one fact
 So each limb carries a ball centred exactly on its pivot -- a shoulder ball, a hip
 ball -- sunk into the torso. The limb swings out of a bulge that never moves and never
 separates, so there is no gap to expose and no membrane to stretch, at any angle. Each
-limb island is metaball-fused WITH ITSELF (ball + capsule) for a soft shoulder, but
-never with the torso.
+limb island is its own metaball field, never fused with the torso. A joint ball is
+emitted only when it is deliberately larger than the limb; metaball fields SUM, so an
+equal-sized one would swell the joint into a bulge rather than sit flush.
 
 Consequently skin weights do NO cross-part blending. Each vertex belongs wholly to one
 part; the only blends are within a limb, across its own elbow or knee.
@@ -75,14 +76,16 @@ ARM_D = 7.5
 SHOULDER = (0.0, 11.0, 66.0)
 ELBOW = (0.0, 13.5, 51.0)
 WRIST = (0.0, 16.0, 36.0)
-SHOULDER_BALL = 5.2                # > ARM_D/2, so the shoulder reads as a deltoid bulge
+SHOULDER_BALL = ARM_D / 2.0        # == the capsule radius, so no extra ball is emitted
+                                   # and the shoulder stays flat. Metaball fields SUM, so a
+                                   # ball larger than this swells into a deltoid bulge.
 
 # Legs. Same trick: the hip ball is centred on the hip pivot, sunk into the torso.
-LEG_D = 10.0
-HIP = (0.0, 7.0, 36.0)
-KNEE = (0.0, 7.0, 20.0)
-FOOT = (0.0, 7.0, 5.0)             # one radius up, so the capsule cap lands on z = 0
-HIP_BALL = 6.0
+LEG_D = 8.5
+HIP = (0.0, 6.0, 36.0)
+KNEE = (0.0, 6.0, 20.0)
+FOOT = (0.0, 6.0, LEG_D / 2.0)     # one radius up, so the capsule cap lands on z = 0
+HIP_BALL = LEG_D / 2.0             # likewise flat -- no hip bulge
 
 PELVIS_Z = 36.0
 
@@ -91,7 +94,7 @@ PELVIS_Z = 36.0
 MBALL_RESOLUTION = 0.55
 MBALL_THRESHOLD = 0.6
 MBALL_STIFFNESS = 2.6
-TARGET_TRIS = 2400
+TARGET_TRIS = 1600                 # low poly on purpose; smooth shading carries it
 
 TORSO_ROUND = 0.9                  # fraction of half-depth spent on corner rounding
 HEAD_RADIAL, HEAD_RINGS = 20, 14
@@ -200,9 +203,15 @@ def build_limb(name, gain, joint, tip, joint_ball, limb_r):
     obj = bpy.data.objects.new(name, mb)
     bpy.context.collection.objects.link(obj)
 
-    ball = mb.elements.new()
-    ball.type, ball.co = "BALL", joint
-    ball.radius, ball.stiffness = joint_ball / gain, MBALL_STIFFNESS
+    # A ball is only emitted when it is genuinely BIGGER than the limb. Metaball fields
+    # SUM, so a ball merely equal to the capsule radius would not sit flush -- the two
+    # would add and swell the joint into a bulge. At joint_ball == limb_r the capsule's
+    # own end cap already provides the hemisphere centred on the pivot, which is all the
+    # invariance trick needs, so the shoulder stays flat.
+    if joint_ball > limb_r * 1.05:
+        ball = mb.elements.new()
+        ball.type, ball.co = "BALL", joint
+        ball.radius, ball.stiffness = joint_ball / gain, MBALL_STIFFNESS
 
     d = tip - joint
     cap = mb.elements.new()
