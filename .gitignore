@@ -1,0 +1,44 @@
+# ---- Unreal Engine generated / build output ----
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+*.VC.db
+*.opensdf
+*.opendb
+*.sdf
+*.suo
+
+# Generated solution files (UE rebuilds these from the .uproject)
+*.sln
+*.slnx
+.vs/
+.vsconfig
+
+# ---- Third-party content packs ----
+# 1.38 GB of redistributable Fab packs, excluded to keep this repo ~45 MB.
+# A fresh clone will NOT open L_Forest until they are re-added from Fab under
+# these exact folder names -- asset paths in the level are absolute (/Game/Art/...),
+# so a renamed folder breaks every reference.
+#
+#   Content/Orasot_Bundle      992 MB
+#   Content/VRS_LowPolyNature  233 MB   forest foliage
+#   Content/VFX_Bundle_2       158 MB
+#   Content/Art                 96 MB
+Content/Orasot_Bundle/
+Content/VRS_LowPolyNature/
+Content/VFX_Bundle_2/
+Content/Art/
+
+# ---- Private working notes ----
+# Kept on disk, deliberately not published.
+HANDOFF.md
+NEXT.md
+Docs/*
+!Docs/CREDITS.md
+refimages/
+
+# ---- Local tool state ----
+.claude/settings.local.json
+.mcp.json
